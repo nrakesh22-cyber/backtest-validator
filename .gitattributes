@@ -1,0 +1,3 @@
+# Normalise line endings so the tool is clean on Windows, macOS and Linux alike.
+* text=auto eol=lf
+*.csv text eol=lf
