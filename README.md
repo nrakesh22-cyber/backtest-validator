@@ -117,7 +117,26 @@ grading you on two checks out of eleven.
 - **The survivorship check estimates** how many companies your test should have lost
   to bankruptcy or takeover. It can't prove your list was biased.
 
-## If you don't use TradingView
+## If you use MetaTrader 4 or 5
+
+```bash
+python backtest_validator.py --metatrader report.htm --plain
+```
+
+To get the file: right-click your results in the terminal and choose **Report** or
+**Save as Report**, then save it as HTML.
+
+All three layouts are handled — the MT4 statement, the MT5 **Positions** report, and
+the MT5 **Deals** report (where each position is split across an `in` row and an
+`out` row). Profit figures include commission and swap wherever the statement lists
+them separately, because the raw Profit column usually doesn't.
+
+Files saved as UTF-16 or in a Cyrillic code page are read correctly.
+
+If your symbols are currency pairs, metals or indices, the survivorship check is
+skipped and marked as not applicable — those instruments don't go bankrupt.
+
+## If you use something else
 
 Any tool that exports CSV works:
 
@@ -128,5 +147,3 @@ python backtest_validator.py --equity curve.csv --trades trades.csv
 `--equity` needs `date,equity`. `--trades` needs `entry_date,exit_date,pnl` and
 optionally `ticker`. Drop `--plain` for the technical report with the underlying
 statistics. Requires `pandas` and `numpy`; `yfinance` is optional.
-
-MetaTrader 4/5 reports are not supported yet.

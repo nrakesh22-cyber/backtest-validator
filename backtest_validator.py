@@ -32,6 +32,8 @@ import argparse
 import math
 import sys
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -60,6 +62,36 @@ EULER_GAMMA = 0.5772156649015329
 # bankruptcy, delisting or acquisition. ~4-5%/yr is the commonly cited range and
 # matches S&P 500 constituent turnover of roughly 20-25 names a year.
 ANNUAL_ATTRITION = 0.045
+
+# Survivorship bias is a fact about companies: they go bankrupt, get delisted, get
+# bought. Currency pairs, metals and index CFDs do none of those things, so the
+# check must not be applied to them. This matters most for MetaTrader users, who
+# are overwhelmingly trading FX - telling someone that eight of their thirty
+# currency pairs should have gone bankrupt would discredit the whole report.
+_CURRENCY_CODES = {
+    "USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD", "SEK", "NOK", "DKK",
+    "SGD", "HKD", "MXN", "ZAR", "TRY", "PLN", "CZK", "HUF", "CNH", "CNY", "RUB",
+    "INR", "BRL", "KRW", "THB", "ILS",
+    "XAU", "XAG", "XPT", "XPD",                       # metals
+    "BTC", "ETH", "XRP", "LTC", "BCH", "ADA", "SOL", "DOT", "BNB", "DOGE",
+    "USDT", "USDC",                                   # crypto
+}
+_INDEX_HINTS = ("US30", "US500", "USTEC", "NAS100", "SPX500", "GER40", "GER30",
+                "DE30", "DE40", "UK100", "JP225", "AUS200", "FRA40", "HK50",
+                "EUSTX50", "VIX", "WTI", "BRENT", "XTIUSD", "XBRUSD")
+
+
+def _is_non_equity(symbol: object) -> bool:
+    """True for FX pairs, metals, crypto and index CFDs - instruments that cannot
+    be survivorship-biased because they are not companies."""
+    s = "".join(ch for ch in str(symbol).upper() if ch.isalnum())
+    if not s:
+        return False
+    if any(s.startswith(h) for h in _INDEX_HINTS):
+        return True
+    if len(s) >= 6 and s[:3] in _CURRENCY_CODES and s[3:6] in _CURRENCY_CODES:
+        return True
+    return False
 
 
 # --------------------------------------------------------------------- statistics
@@ -534,10 +566,17 @@ def check_survivorship_exposure(trades: pd.DataFrame, years: float) -> CheckResu
         return _unknown("survivorship_exposure", "Survivorship exposure",
                         "No ticker column in trade log")
 
-    universe = int(trades["ticker"].nunique())
+    symbols = trades["ticker"].dropna().unique()
+    universe = int(len(symbols))
     if universe < 2 or years <= 0:
         return _unknown("survivorship_exposure", "Survivorship exposure",
                         "Universe too small to estimate")
+
+    non_equity = sum(1 for s in symbols if _is_non_equity(s))
+    if non_equity >= universe / 2:
+        return _unknown(
+            "survivorship_exposure", "Survivorship exposure",
+            "Not applicable - these are currencies, metals or indices, not companies")
 
     expected_dead = universe * (1 - (1 - ANNUAL_ATTRITION) ** years)
     pct = expected_dead / universe * 100
@@ -1117,6 +1156,238 @@ def load_tradingview(path: str, initial_capital: float) -> tuple[pd.Series, pd.D
     return equity, trades, note
 
 
+# --------------------------------------------------- MetaTrader 4/5 statements
+#
+# MT4 and MT5 export HTML, not CSV, and the files are a thicket of nested tables
+# written for a browser rather than a parser. They are also frequently saved as
+# UTF-16, or in a Cyrillic code page, because MetaQuotes is a Russian company and
+# many broker builds ship localised terminals.
+#
+# Rather than pull in lxml or BeautifulSoup - which would break the promise that
+# this tool needs nothing but pandas and numpy - the table extraction below uses
+# html.parser from the standard library. It ignores table nesting entirely and
+# collects every row it finds, then locates the trade table by its header text.
+# That is cruder than a real DOM walk and considerably harder to break.
+
+class _RowCollector(HTMLParser):
+    """Flattens every <tr> in a document into a list of cell strings."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._cell is not None and self._row is not None:
+            self._row.append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if any(c for c in self._row):
+                self.rows.append(self._row)
+            self._row = None
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+def _read_any_encoding(path: str) -> str:
+    """MetaTrader writes UTF-16, UTF-8 and legacy code pages depending on build and
+    locale. Try them in order of likelihood and fall back to a lossy read rather
+    than failing outright - a mangled comment field costs nothing, a crash costs
+    the user the whole report."""
+    raw = Path(path).read_bytes()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace")
+    for enc in ("utf-8-sig", "utf-8", "cp1251", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1", errors="replace")
+
+
+def _mt_num(v: str) -> float:
+    """MetaTrader numbers carry thousands separators and sometimes a space as the
+    group separator. Empty cells are common and mean zero, not missing."""
+    if v is None:
+        return float("nan")
+    s = str(v).strip().replace("\xa0", "").replace(" ", "").replace(",", "")
+    if not s or s in ("-", "—"):
+        return float("nan")
+    neg = s.startswith("(") and s.endswith(")")
+    s = s.strip("()")
+    try:
+        val = float(s)
+    except ValueError:
+        return float("nan")
+    return -val if neg else val
+
+
+def _find_header(rows: list[list[str]], required: list[str]) -> int:
+    """Index of the first row containing all `required` header words."""
+    for i, row in enumerate(rows):
+        low = [c.strip().lower() for c in row]
+        if all(any(req == c or req in c for c in low) for req in required):
+            return i
+    return -1
+
+
+def load_metatrader(path: str, initial_capital: float) -> tuple[pd.Series, pd.DataFrame, str]:
+    """Parse an MT4 statement or MT5 report into (equity, trades, note).
+
+    Three layouts are recognised, in order of preference:
+      * MT5 "Positions" - one row per closed position, the cleanest source
+      * MT4 statement   - one row per closed trade, plus interleaved balance rows
+      * MT5 "Deals"     - two rows per position (direction in/out), paired here
+    """
+    rows = _RowCollector()
+    rows.feed(_read_any_encoding(path))
+    all_rows = rows.rows
+    if not all_rows:
+        raise SystemExit(
+            "No tables found in that file.\n"
+            "  Expected an MT4 statement or MT5 report saved as HTML.\n"
+            "  In MetaTrader: right-click the results, 'Report' or 'Save as Report'.")
+
+    # Order matters. An MT5 "Deals" header also satisfies the "Positions" pattern
+    # (both carry time/symbol/type/profit), so the Direction column - which only
+    # Deals has - must be tested first. Getting this backwards makes every deal
+    # look like a completed round trip and doubles the trade count.
+    hdr = _find_header(all_rows, ["direction", "profit"])
+    layout = "MT5 deals"
+    if hdr < 0:
+        hdr = _find_header(all_rows, ["open time", "type", "close time", "profit"])
+        layout = "MT4 statement"
+    if hdr < 0:
+        hdr = _find_header(all_rows, ["time", "symbol", "type", "profit"])
+        layout = "MT5 positions"
+    if hdr < 0:
+        raise SystemExit(
+            "Found tables, but none of them look like a trade history.\n"
+            "  Export the full statement including the list of trades, not just\n"
+            "  the summary figures.")
+
+    header = [c.strip().lower() for c in all_rows[hdr]]
+
+    def col(*names: str) -> int:
+        for n in names:
+            for i, h in enumerate(header):
+                if h == n:
+                    return i
+        for n in names:
+            for i, h in enumerate(header):
+                if n in h:
+                    return i
+        return -1
+
+    i_type = col("type")
+    i_profit = col("profit")
+    i_comm = col("commission")
+    i_swap = col("swap")
+    i_tax = col("taxes", "tax")
+    i_bal = col("balance")
+    i_sym = col("symbol", "item")
+    i_dir = col("direction")
+    n_head = len(header)
+
+    body = [r for r in all_rows[hdr + 1:] if len(r) >= max(3, n_head - 3)]
+
+    def cell(row: list[str], idx: int) -> str:
+        return row[idx] if 0 <= idx < len(row) else ""
+
+    def net_profit(row: list[str]) -> float:
+        total = 0.0
+        found = False
+        for idx in (i_profit, i_comm, i_swap, i_tax):
+            if idx < 0:
+                continue
+            v = _mt_num(cell(row, idx))
+            if not math.isnan(v):
+                total += v
+                found = True
+        return total if found else float("nan")
+
+    times = [i for i, h in enumerate(header) if "time" in h]
+    records, balances = [], []
+
+    if layout == "MT5 deals":
+        open_deal = None
+        for r in body:
+            direction = cell(r, i_dir).strip().lower()
+            t = pd.to_datetime(cell(r, times[0]) if times else "", errors="coerce")
+            if pd.isna(t):
+                continue
+            if direction.startswith("in"):
+                open_deal = (t, cell(r, i_sym))
+            elif direction.startswith("out") and open_deal is not None:
+                records.append({"entry_date": open_deal[0], "exit_date": t,
+                                "pnl": net_profit(r), "ticker": open_deal[1] or "UNKNOWN"})
+                if i_bal >= 0:
+                    balances.append((t, _mt_num(cell(r, i_bal))))
+                open_deal = None
+    else:
+        t_open = times[0] if times else -1
+        t_close = times[1] if len(times) > 1 else t_open
+        for r in body:
+            kind = cell(r, i_type).strip().lower()
+            if kind in ("balance", "credit", "deposit", "withdrawal"):
+                continue                      # account operations, not trades
+            entry = pd.to_datetime(cell(r, t_open), errors="coerce")
+            exit_ = pd.to_datetime(cell(r, t_close), errors="coerce")
+            if pd.isna(entry) and pd.isna(exit_):
+                continue
+            if pd.isna(exit_):
+                continue                      # position still open
+            pnl = net_profit(r)
+            if math.isnan(pnl):
+                continue
+            records.append({"entry_date": entry if not pd.isna(entry) else exit_,
+                            "exit_date": exit_, "pnl": pnl,
+                            "ticker": cell(r, i_sym) or "UNKNOWN"})
+            if i_bal >= 0:
+                b = _mt_num(cell(r, i_bal))
+                if not math.isnan(b):
+                    balances.append((exit_, b))
+
+    if not records:
+        raise SystemExit(
+            f"Recognised a {layout} table but extracted no completed trades.\n"
+            "  Open positions and balance entries are skipped by design; if the\n"
+            "  statement only contains those, there is nothing to check yet.")
+
+    trades = pd.DataFrame(records).sort_values("exit_date").reset_index(drop=True)
+
+    # The running balance column is authoritative when present - it is the
+    # terminal's own accounting, already inclusive of everything.
+    if balances:
+        bal = pd.Series([b for _, b in balances],
+                        index=pd.DatetimeIndex([t for t, _ in balances])).sort_index()
+        bal = bal[~bal.index.duplicated(keep="last")].dropna()
+        equity, basis = bal, "the statement's own balance column"
+    else:
+        equity = initial_capital + trades["pnl"].fillna(0.0).cumsum()
+        equity.index = pd.DatetimeIndex(trades["exit_date"])
+        basis = f"summed net profit from {initial_capital:,.0f}"
+
+    start_val = float(equity.iloc[0] - trades["pnl"].iloc[0]) if balances else float(initial_capital)
+    seed = pd.Series([start_val], index=pd.DatetimeIndex([trades["entry_date"].min()]))
+    equity = pd.concat([seed, equity])
+    equity = equity[~equity.index.duplicated(keep="last")].sort_index().astype(float)
+
+    note = (f"Read {len(trades)} completed trades from a {layout}. Equity curve built "
+            f"from {basis}. Net profit includes commission and swap where the "
+            f"statement reported them.")
+    return equity, trades, note
+
+
 def _tv_buy_and_hold(trades: pd.DataFrame, equity_index: pd.DatetimeIndex) -> pd.Series | None:
     """Approximate buy-and-hold of the traded instrument from the prices in the
     export. Exact at the endpoints, which is all the total-return comparison needs;
@@ -1180,8 +1451,12 @@ def build_report(args) -> str:
     tv_trades = None
     approx_benchmark = False
 
+    mt_trades = None
     if args.tradingview:
         equity, tv_trades, note = load_tradingview(args.tradingview, args.initial_capital)
+        print(f"note: {note}", file=sys.stderr)
+    elif args.metatrader:
+        equity, mt_trades, note = load_metatrader(args.metatrader, args.initial_capital)
         print(f"note: {note}", file=sys.stderr)
     else:
         equity = _read_csv_series(args.equity, "date", "equity", "--equity")
@@ -1211,6 +1486,8 @@ def build_report(args) -> str:
     trades = None
     if tv_trades is not None:
         trades = tv_trades
+    elif mt_trades is not None:
+        trades = mt_trades
     elif args.trades:
         trades = pd.read_csv(args.trades)
         trades.columns = [c.strip().lower() for c in trades.columns]
@@ -1285,6 +1562,8 @@ def main():
         epilog="Your data never leaves your machine.")
     p.add_argument("--tradingview", metavar="FILE",
                    help="TradingView 'List of Trades' CSV - gives everything in one file")
+    p.add_argument("--metatrader", metavar="FILE",
+                   help="MetaTrader 4 statement or MT5 report saved as HTML")
     p.add_argument("--initial-capital", type=float, default=100000.0,
                    help="Starting capital used in the TradingView test (default 100000)")
     p.add_argument("--equity", help="CSV: date,equity")
@@ -1306,10 +1585,13 @@ def main():
     p.add_argument("--oos", help="Out-of-sample type: temporal | cross_sectional | none")
     p.add_argument("--plateau", help="Is performance a broad parameter plateau? yes/no")
     args = p.parse_args()
-    if not args.tradingview and not args.equity:
-        p.error("give either --tradingview export.csv or --equity curve.csv")
-    if args.tradingview and args.equity:
-        p.error("--tradingview already contains the equity curve; drop --equity")
+    sources = [bool(args.tradingview), bool(args.metatrader), bool(args.equity)]
+    if not any(sources):
+        p.error("give one of --tradingview export.csv, --metatrader report.html, "
+                "or --equity curve.csv")
+    if sum(sources) > 1:
+        p.error("give only one input source; --tradingview and --metatrader already "
+                "contain the equity curve")
 
     report = build_report(args)
     print(report)
